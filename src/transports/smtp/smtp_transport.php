@@ -246,6 +246,13 @@ class ezcMailSmtpTransport implements ezcMailTransport
     protected $keepConnection = false;
 
     /**
+     * Holds the reply code of the last reply read with getReplyCode().
+     *
+     * @var string
+     */
+    protected $lastReplyCode;
+
+    /**
      * Holds the properties of this class.
      *
      * @var array(string=>mixed)
@@ -486,7 +493,8 @@ class ezcMailSmtpTransport implements ezcMailTransport
 
             // check all envelope addresses before anything is sent, so that
             // an invalid address does not leave a half-finished transaction
-            foreach ( array_merge( array( $from ), $recipients ) as $email )
+            $this->composeSmtpMailAddress( $from, true );
+            foreach ( $recipients as $email )
             {
                 $this->composeSmtpMailAddress( $email );
             }
@@ -665,7 +673,9 @@ class ezcMailSmtpTransport implements ezcMailTransport
                 foreach ( $methods as $method )
                 {
                     // the auth*() methods throw an exception on failure; try
-                    // the next (weaker) method in that case
+                    // the next (weaker) method only if the server rejected
+                    // the method itself, not the credentials
+                    $this->lastReplyCode = null;
                     try
                     {
                         if ( $this->auth( $method ) === true )
@@ -676,6 +686,10 @@ class ezcMailSmtpTransport implements ezcMailTransport
                     }
                     catch ( ezcMailTransportSmtpException $e )
                     {
+                        if ( !self::isAuthMethodRejected( $this->lastReplyCode ) )
+                        {
+                            throw $e;
+                        }
                         $errors[] = "{$method}: " . $e->getMessage();
                     }
                 }
@@ -687,6 +701,28 @@ class ezcMailSmtpTransport implements ezcMailTransport
             }
         }
         $this->status = self::STATUS_AUTHENTICATED;
+    }
+
+    /**
+     * Returns true if the SMTP reply code $replyCode to a failed AUTH exchange
+     * means that the server rejected the authentication method, so that the
+     * next method can be tried.
+     *
+     * This is the case for permanent errors (5xx) like 504 (mechanism not
+     * supported), 534 (mechanism too weak), 538 (encryption required) or 501
+     * (reply to a cancelled exchange), except for 535: the credentials are
+     * invalid, and trying them with every other method as well would only
+     * multiply the failed logins, which can lock the account or get the
+     * client blocked. Temporary errors (4xx, e.g. 454) are not related to the
+     * method either and end the login as well; the caller can try again
+     * later.
+     *
+     * @param string $replyCode
+     * @return bool
+     */
+    protected static function isAuthMethodRejected( $replyCode )
+    {
+        return is_string( $replyCode ) && strlen( $replyCode ) === 3 && $replyCode[0] === '5' && $replyCode !== '535';
     }
 
     /**
@@ -844,6 +880,9 @@ class ezcMailSmtpTransport implements ezcMailTransport
         if ( !isset( $params['nonce'] ) ||
              !isset( $params['algorithm'] ) )
         {
+            // cancel the exchange, the server waits for a response
+            $this->sendData( '*' );
+            $this->getReplyCode( $serverResponse );
             throw new ezcMailTransportSmtpException( 'SMTP server did not send a correct DIGEST-MD5 challenge.' );
         }
 
@@ -1097,18 +1136,24 @@ class ezcMailSmtpTransport implements ezcMailTransport
      *
      * If $email is already enclosed within '< >' it is returned unmodified.
      *
+     * An empty $email is only accepted if $reversePath is true and results
+     * in the null reverse-path "<>" (RFC 5321, section 4.5.5), which is used
+     * by bounces and other notifications.
+     *
      * @throws ezcMailTransportSmtpException
-     *         if $email contains a line break, a NUL character or angle
-     *         brackets other than the enclosing ones, which would allow to
-     *         inject SMTP commands or parameters
+     *         if $email contains whitespace (including line breaks), a NUL
+     *         character or angle brackets other than the enclosing ones,
+     *         which would allow to inject SMTP commands or parameters,
+     *         or if $email is empty and $reversePath is false
      * @param string $email
+     * @param bool $reversePath
      * @return string
      */
-    protected function composeSmtpMailAddress( $email )
+    protected function composeSmtpMailAddress( $email, $reversePath = false )
     {
         $email = (string) $email;
         $address = preg_match( '/^<(.*)>$/sD', $email, $matches ) ? $matches[1] : $email;
-        if ( $address === '' || strpbrk( $address, "<>\r\n\0" ) !== false )
+        if ( ( $address === '' && !$reversePath ) || preg_match( '/[\s\0<>]/', $address ) )
         {
             throw new ezcMailTransportSmtpException( "Invalid envelope address '" . addcslashes( $email, "\0..\37\177" ) . "'." );
         }
@@ -1131,7 +1176,7 @@ class ezcMailSmtpTransport implements ezcMailTransport
     {
         if ( $this->status === self::STATUS_AUTHENTICATED )
         {
-            $this->sendData( 'MAIL FROM:' . $this->composeSmtpMailAddress( $from ) . '' );
+            $this->sendData( 'MAIL FROM:' . $this->composeSmtpMailAddress( $from, true ) . '' );
             if ( $this->getReplyCode( $error ) !== '250' )
             {
                 throw new ezcMailTransportSmtpException( "MAIL FROM failed with error: $error." );
@@ -1245,7 +1290,7 @@ class ezcMailSmtpTransport implements ezcMailTransport
      */
     protected function getReplyCode( &$line )
     {
-        return substr( trim( $line = $this->getData() ), 0, 3 );
+        return $this->lastReplyCode = substr( trim( $line = $this->getData() ), 0, 3 );
     }
 
     /**

@@ -190,6 +190,12 @@ class ezcMailTransportSmtpLocalTest extends ezcTestCase
             array( "from@example.com", "Name <evil@example.com>" ),
             array( "from@example.com", "to@example.com> NOTIFY=NEVER <x" ),
             array( "from@example.com", "to@example.com\0" ),
+            array( "from@example.com", "<to@example.com NOTIFY=NEVER>" ),
+            array( "from@example.com", "to@example.com NOTIFY=NEVER" ),
+            array( "from@example.com SIZE=1", "to@example.com" ),
+            array( "from@example.com", "to@example.com\tNOTIFY=NEVER" ),
+            array( "from@example.com", "" ),
+            array( "from@example.com", "<>" ),
         );
     }
 
@@ -234,6 +240,26 @@ class ezcMailTransportSmtpLocalTest extends ezcTestCase
         self::createTransport( $server )->send( $mail );
 
         $this->assertContains( 'RCPT TO:<to@example.com>', $server->commands() );
+    }
+
+    public static function nullReversePaths()
+    {
+        return array( array( '' ), array( '<>' ) );
+    }
+
+    /**
+     * @dataProvider nullReversePaths
+     */
+    public function testNullReversePathIsAccepted( $from )
+    {
+        $server = $this->startServer();
+        $mail = self::createMail();
+        $mail->from = new ezcMailAddress( $from );
+        self::createTransport( $server )->send( $mail );
+
+        $commands = $server->commands();
+        $this->assertSame( 'MAIL FROM:<>', $commands[1] );
+        $this->assertSame( 'RCPT TO:<to@example.com>', $commands[2] );
     }
 
     public function testDotStuffingWithUnixLineBreaks()
@@ -292,7 +318,7 @@ class ezcMailTransportSmtpLocalTest extends ezcTestCase
             'ehlo' => "250-localhost\n250 AUTH CRAM-MD5 LOGIN",
             'sequence' => array(
                 '334 ' . base64_encode( '<1234@localhost>' ),
-                '535 Authentication failed',
+                '534 Authentication mechanism is too weak',
                 '334 VXNlcm5hbWU6',
                 '334 UGFzc3dvcmQ6',
                 '235 Authentication succeeded',
@@ -308,13 +334,98 @@ class ezcMailTransportSmtpLocalTest extends ezcTestCase
         $this->assertContains( 'MAIL FROM:<from@example.com>', $commands );
     }
 
+    public static function authMethodRejections()
+    {
+        return array(
+            array( '504 Unrecognized authentication type' ),
+            array( '534 Authentication mechanism is too weak' ),
+            array( '538 Encryption required for requested authentication mechanism' ),
+        );
+    }
+
+    /**
+     * @dataProvider authMethodRejections
+     */
+    public function testAuthFallsBackIfMethodIsRejected( $rejection )
+    {
+        $server = $this->startServer( array(
+            'ehlo' => "250-localhost\n250 AUTH CRAM-MD5 PLAIN",
+            'sequence' => array(
+                $rejection,
+                '235 Authentication succeeded',
+            ),
+        ) );
+        self::createTransport( $server, 'user', 'secret' )->send( self::createMail() );
+
+        $commands = $server->commands();
+        $this->assertSame( array( 'EHLO localhost', 'AUTH CRAM-MD5', 'AUTH PLAIN ' . base64_encode( "\0user\0secret" ), 'MAIL FROM:<from@example.com>' ),
+                           array_slice( $commands, 0, 4 ) );
+    }
+
+    public static function authFailuresWithoutFallback()
+    {
+        return array(
+            // invalid credentials: trying them with other methods would only
+            // add failed logins
+            array( '334 ' . base64_encode( '<1234@localhost>' ), '535 Authentication credentials invalid' ),
+            // temporary failure
+            array( '334 ' . base64_encode( '<1234@localhost>' ), '454 Temporary authentication failure' ),
+            array( '454 Temporary authentication failure', '235 Authentication succeeded' ),
+        );
+    }
+
+    /**
+     * @dataProvider authFailuresWithoutFallback
+     */
+    public function testAuthDoesNotFallBackOnCredentialOrTemporaryFailure( $first, $second )
+    {
+        $server = $this->startServer( array(
+            'ehlo' => "250-localhost\n250 AUTH CRAM-MD5 LOGIN PLAIN",
+            'sequence' => array(
+                $first,
+                $second,
+                '235 Authentication succeeded',
+                '235 Authentication succeeded',
+            ),
+        ) );
+        try
+        {
+            self::createTransport( $server, 'user', 'secret' )->send( self::createMail() );
+            $this->fail( 'Expected exception was not thrown.' );
+        }
+        catch ( ezcMailTransportException $e )
+        {
+        }
+
+        $commands = $server->commands();
+        $auth = array_filter( $commands, function ( $command ) { return strncmp( $command, 'AUTH ', 5 ) === 0; } );
+        $this->assertSame( array( 'AUTH CRAM-MD5' ), array_values( $auth ) );
+        $this->assertNotContains( 'MAIL FROM:<from@example.com>', $commands );
+    }
+
+    public function testAuthDigestMd5InvalidChallengeIsCancelled()
+    {
+        $server = $this->startServer( array(
+            'ehlo' => "250-localhost\n250 AUTH DIGEST-MD5 PLAIN",
+            'sequence' => array(
+                '334 ' . base64_encode( 'realm="localhost"' ),
+                '501 Authentication cancelled',
+                '235 Authentication succeeded',
+            ),
+        ) );
+        self::createTransport( $server, 'user', 'secret' )->send( self::createMail() );
+
+        $this->assertSame( array( 'EHLO localhost', 'AUTH DIGEST-MD5', '*', 'AUTH PLAIN ' . base64_encode( "\0user\0secret" ) ),
+                           array_slice( $server->commands(), 0, 4 ) );
+    }
+
     public function testAuthFailsIfAllMethodsFail()
     {
         $server = $this->startServer( array(
             'ehlo' => "250-localhost\n250 AUTH LOGIN PLAIN",
             'sequence' => array(
-                '535 Authentication failed',
-                '535 Authentication failed',
+                '504 Unrecognized authentication type',
+                '534 Authentication mechanism is too weak',
             ),
         ) );
         try
