@@ -660,19 +660,29 @@ class ezcMailSmtpTransport implements ezcMailTransport
                 }
 
                 $authenticated = false;
+                $errors = array();
                 $methods = $this->sortAuthMethods( $methods );
                 foreach ( $methods as $method )
                 {
-                    if ( $this->auth( $method ) === true )
+                    // the auth*() methods throw an exception on failure; try
+                    // the next (weaker) method in that case
+                    try
                     {
-                        $authenticated = true;
-                        break;
+                        if ( $this->auth( $method ) === true )
+                        {
+                            $authenticated = true;
+                            break;
+                        }
+                    }
+                    catch ( ezcMailTransportSmtpException $e )
+                    {
+                        $errors[] = "{$method}: " . $e->getMessage();
                     }
                 }
 
                 if ( $authenticated === false )
                 {
-                    throw new ezcMailTransportSmtpException( 'SMTP server did not respond correctly to any of the authentication methods ' . implode( ', ', $methods ) . '.' );
+                    throw new ezcMailTransportSmtpException( 'SMTP server did not respond correctly to any of the authentication methods ' . implode( ', ', $methods ) . '.' . ( count( $errors ) ? ' ' . implode( ' ', $errors ) : '' ) );
                 }
             }
         }
@@ -747,6 +757,13 @@ class ezcMailSmtpTransport implements ezcMailTransport
         $supportedAuthMethods = self::getSupportedAuthMethods();
         foreach ( $supportedAuthMethods as $method )
         {
+            // authNtlm() needs ext/mcrypt, which is not available since
+            // PHP 7.2; do not let it prevent the other methods from being used
+            if ( $method === self::AUTH_NTLM && !ezcBaseFeatures::hasExtensionSupport( 'mcrypt' ) )
+            {
+                continue;
+            }
+
             if ( in_array( $method, $methods ) )
             {
                 $result[] = $method;
@@ -881,6 +898,10 @@ class ezcMailSmtpTransport implements ezcMailTransport
 
         if ( $rspauthServer !== $rspauthClient )
         {
+            // the server waits for a response; cancel the exchange so that
+            // the connection can be used for another AUTH command
+            $this->sendData( '*' );
+            $this->getReplyCode( $serverResponse );
             throw new ezcMailTransportSmtpException( 'SMTP server did not responded correctly to the DIGEST-MD5 authentication.' );
         }
 
@@ -1034,7 +1055,15 @@ class ezcMailSmtpTransport implements ezcMailTransport
     {
         $digest = base64_encode("user={$this->user}\1auth=Bearer {$this->password}\1\1");
         $this->sendData( "AUTH XOAUTH2 {$digest}" );
-        if ( $this->getReplyCode( $error ) !== '235' )
+        $replyCode = $this->getReplyCode( $error );
+        if ( $replyCode === '334' )
+        {
+            // the server sent an error challenge (RFC 7628, section 3.2.2)
+            // and expects an empty response before it ends the exchange
+            $this->sendData( '' );
+            $replyCode = $this->getReplyCode( $response );
+        }
+        if ( $replyCode !== '235' )
         {
             throw new ezcMailTransportSmtpException( 'SMTP server did not accept the provided OAuth token.' );
         }
