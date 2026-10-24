@@ -324,8 +324,7 @@ class ezcMailTest extends ezcTestCase
         $this->mail->subject = "זרו";
         $this->mail->body = new ezcMailText( "Dette er body ßßזרווו" );
         $this->mail->generateHeaders();
-        $expected = '<'. date( 'YmdGHjs' ) . '.' . getmypid() . '.61@ez.no>';
-        $this->assertEquals( $expected, $this->mail->getHeader( 'Message-Id' ) );
+        $this->assertMatchesRegularExpression( '/^<\d{14,16}\.[0-9a-f.]+@ez\.no>$/', $this->mail->getHeader( 'Message-Id' ) );
     }
 
     public function testMessageID2()
@@ -532,6 +531,16 @@ class ezcMailTest extends ezcTestCase
         {
             $this->assertEquals( "The value 'with space@example.com' that you were trying to assign to setting 'returnPath' is invalid. Allowed values are: a valid email address or null.", $e->getMessage() );
         }
+    }
+
+    public function testMessageIdIsRandom()
+    {
+        $id1 = ezcMailTools::generateMessageId( 'example.com' );
+        $id2 = ezcMailTools::generateMessageId( 'example.com' );
+
+        $this->assertMatchesRegularExpression( '/^\d{14,16}\.[0-9a-f]{24}@example\.com$/', $id1 );
+        $this->assertNotEquals( $id1, $id2 );
+        $this->assertStringNotContainsString( '.' . getmypid() . '.', $id1 );
     }
 
     public static function suite()
